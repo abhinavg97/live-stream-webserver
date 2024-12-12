@@ -3,58 +3,378 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Live Stream</title>
+    <title>Peer-to-Peer Live Streaming</title>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+    <script src="https://cdn.jsdelivr.net/npm/peerjs@1.3.2/dist/peerjs.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
+    <script src="https://cdn.socket.io/4.5.1/socket.io.min.js"></script>
+    <style>
+        #logs {
+            margin-top: 20px;
+            padding: 10px;
+            border: 1px solid #ccc;
+            background: #f9f9f9;
+            max-height: 300px;
+            overflow-y: scroll;
+            font-family: monospace;
+            font-size: 14px;
+        }
+        button {
+            margin: 10px 0;
+        }
+    </style>
 </head>
 <body>
-    <h1>Live Streaming Video</h1>
-    <video id="videoPlayer" controls autoplay></video>
+    <h1>Peer-to-Peer Live Streaming</h1>
+    <video id="videoPlayer" controls autoplay muted></video>
+    <button id="reloadButton">Reload Stream</button>
+    <div id="logs"></div>
 
     <script>
         const video = document.getElementById('videoPlayer');
-        const videoSrc = 'http://localhost:8002/stream';  // The stream URL calling the pop
+        const reloadButton = document.getElementById('reloadButton');
+        const logsDiv = document.getElementById('logs');
+        const videoSrc = 'http://localhost:8002/stream'; // Fallback stream URL
+        const cache = new Map(); // Cache for storing video chunks
+        const connectedPeers = {}; // WebRTC peer connections
+        const signalingServerUrl = "http://localhost:9030"; // Socket.IO signaling server
+        const peerId = `peer-${Math.random().toString(36).substring(2, 9)}`; // Unique peer ID
+        const signalingServer = io('http://localhost:9030');
 
-        // Function to load the HLS stream
-        function loadStream() {
-            // Reset the video element's source and load the stream
-            if (Hls.isSupported()) {
-                const hls = new Hls();
-                hls.loadSource(videoSrc);  // Load the playlist index.m3u8
-                hls.attachMedia(video);    // Attach the video element
-                hls.on(Hls.Events.MANIFEST_PARSED, function () {
-                    video.play();  // Start playback when the playlist is loaded
-                });
+        function cloneBuffer(data) {
+            if (!data) {
+                return data;
+            }
+            return data.slice(0);
+        }
 
-                // Listen for errors and handle recovery
-                hls.on(Hls.Events.ERROR, function (event, data) {
-                    if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-                        console.log('Media error detected, attempting recovery');
-                        hls.recoverMediaError();  // Try to recover from media error
-                    } else if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-                        console.log('Network error, reloading stream...');
-                        loadStream();  // Reload the stream if there's a network error
+        function generateRandomHash(length = 16) {
+            const array = new Uint8Array(length);
+            window.crypto.getRandomValues(array); // Generate cryptographically secure random values
+            return Array.from(array, byte => byte.toString(16).padStart(2, '0')).join('');
+        }
+
+        // Log helper function
+        function logToConsoleAndHtml(message) {
+            {#console.log(message);#}
+            {#const logEntry = document.createElement('div');#}
+            {#logEntry.textContent = message;#}
+            {#logsDiv.appendChild(logEntry);#}
+            {#logsDiv.scrollTop = logsDiv.scrollHeight; // Scroll to the bottom#}
+        }
+
+        function logNew(message) {
+            console.log(message);
+            const logEntry = document.createElement('div');
+            logEntry.textContent = message;
+            logsDiv.appendChild(logEntry);
+            // logsDiv.scrollTop = logsDiv.scrollHeight; // Scroll to the bottom
+        }
+
+        function storeLatency(value) {
+            axios.post('http://localhost:8500/update_latency', {
+                value: value, // Send the value in the request body
+            })
+            .then(response => {
+                console.log('Latency updated successfully:', response.data);
+            })
+            .catch(error => {
+                if (error.response) {
+                    console.error('Failed to update Latency:', error.response.data);
+                } else {
+                    console.error('Error making the request:', error.message);
+                }
+            });
+        }
+
+
+        logToConsoleAndHtml(`Using Peer ID: ${peerId}`);
+
+        // Creating PeerJS instance
+        const peer = new Peer(peerId);
+        peer.on('open', (peerId) => {
+            logToConsoleAndHtml(`PeerJS connected with ID: ${peerId}`);
+            logNew(`Peer connected with ID: ${peerId}`);
+            signalingServer.emit('join', { peerId });
+        });
+
+        // Handle incoming peer connections
+        peer.on('connection', (conn) => {
+            logToConsoleAndHtml(`Connected to peer: ${conn.peer}`);
+            setupConnection(conn);
+        });
+
+        const activeRequests = new Map(); // Track pending requests
+        const activePeersContact = new Map(); // Track contacted peer counts
+        const requiredLength = new Map();
+
+        // Set up connection handlers
+        function setupConnection(conn) {
+            conn.on('data', (message) => {
+                const requestId = message.requestId;
+                logToConsoleAndHtml(`Message from ${conn.peer}: ${message}`);
+                if (message.type === "chunk") {
+                    // Handle chunk responses
+                    logToConsoleAndHtml(`Received chunk response (${message.chunkUrl}) from peer ${conn.peer}`);
+                    logNew(`${requestId}: Received chunk response (${message.chunkUrl}) from peer ${conn.peer}, now I will check active requests to see if its handled or not`);
+                    if (activeRequests.has(message.chunkUrl)) {
+                        logToConsoleAndHtml(`Good news, I have received the chunk from peer ${conn.peer}`);
+                        logNew(`${requestId}: Good news, I have received the chunk from peer ${conn.peer}`);
+                        const resolve = activeRequests.get(message.chunkUrl);
+                        cache.set(message.chunkUrl, cloneBuffer(message.chunkData));
+                        logToConsoleAndHtml(`${requestId}: Cached chunk after getting from peer ${conn.peer}: ${message.chunkUrl}`);
+                        activeRequests.delete(message.chunkUrl); // Clean up
+                        activePeersContact.delete(message.chunkUrl); // Clean up
+                        requiredLength.delete(message.chunkUrl);
+                        resolve(message.chunkData); // Resolve the Promise
                     }
-                });
+                }
+                else if (message.type === "chunk_not_found") {
+                    logNew(`${message.requestId}: The peer ${conn.peer} doesn't seem to have the chunk ${message.chunkUrl}`);
 
-            } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-                // For Safari (which natively supports HLS)
+                    if (activeRequests.has(message.chunkUrl)) {
+                        const resolve = activeRequests.get(message.chunkUrl);
+                        let curCount = activePeersContact.get(message.chunkUrl);
+                        activePeersContact.delete(message.chunkUrl);
+                        activePeersContact.set(message.chunkUrl, curCount + 1);
+                        if (curCount + 1 === requiredLength.get(message.chunkUrl)) {
+                            logNew(`${message.requestId}: Contacted all peers, hence stopping peer communication`);
+                            activeRequests.delete(message.chunkUrl);
+                            activePeersContact.delete(message.chunkUrl);
+                            requiredLength.delete(message.chunkUrl);
+                            resolve(null);
+                        }
+                    }
+                }
+                else if (message.type === "request") {
+                    // Handle chunk requests
+                    logToConsoleAndHtml(`>>>>>> Received chunk request (${message.chunkUrl}) from peer ${conn.peer}`);
+                    logToConsoleAndHtml(`The keys I have are ${Array.from(cache.keys())}`)
+                    const chunkData = cloneBuffer(cache.get(message.chunkUrl));
+                    if (chunkData) {
+                        // Send the requested chunk back
+                        if (conn.open) {
+                            logToConsoleAndHtml("SUCCESS!!!, I will send the chunk right now !!!");
+                            logNew(`${requestId}: SUCCESS!!!, I will send the chunk right now !!!`);
+                            conn.send(
+                                {
+                                    type: "chunk",
+                                    chunkUrl: message.chunkUrl,
+                                    chunkData,
+                                    requestId,
+                                }
+                            );
+                        }
+
+                    } else {
+                        conn.send({
+                            requestId,
+                            type: "chunk_not_found",
+                            chunkUrl: message.chunkUrl
+                        })
+                        logToConsoleAndHtml(`Chunk not found in cache: ${message.chunkUrl}`);
+                    }
+                } else {
+                    logToConsoleAndHtml(`Received unknown message type from peer ${conn.peer}: ${event.data}`);
+                }
+            });
+
+            conn.on('close', () => {
+                logToConsoleAndHtml(`------Connection to ${conn.peer} closed`);
+                delete connectedPeers[conn.peer];
+            });
+
+            conn.on('open', () => {
+                logToConsoleAndHtml(`-------Connection with ${conn.peer} is open`);
+            });
+        }
+
+        signalingServer.on('peer_list', (peerIds) => {
+            logToConsoleAndHtml(`Updated peer list: ${peerIds.join(', ')}`);
+
+            peerIds.forEach((otherPeerId) => {
+                if (otherPeerId !== peerId && !connectedPeers[otherPeerId]) {
+                    const conn = peer.connect(otherPeerId);
+                    setupConnection(conn);
+                    connectedPeers[otherPeerId] = conn;
+                }
+            });
+        });
+
+        // Notify signaling server on unload
+        window.addEventListener('beforeunload', () => {
+            signalingServer.emit('leave', { peerId: peer.id });
+        });
+
+
+        async function requestChunkFromPeers(requestId, chunkUrl) {
+            return new Promise((resolve) => {
+                if (Object.entries(connectedPeers).length === 0) {
+                    resolve(null);
+                }
+
+                if (activeRequests.has(chunkUrl)) {
+                    logToConsoleAndHtml(`Duplicate request for chunk: ${chunkUrl}`);
+                    return; // Avoid duplicate requests
+                }
+
+                activeRequests.set(chunkUrl, resolve); // Track the request
+                activePeersContact.set(chunkUrl, 0); // Track peer counts
+                requiredLength.set(chunkUrl, Object.entries(connectedPeers).length); // Track the length at this moment
+
+                // Send the request to all connected peers
+                for (const [peerId, conn] of Object.entries(connectedPeers)) {
+                    if (!conn.open) continue;
+
+                    logNew(`${requestId}: Trying peer ${conn.peer}`);
+                    logToConsoleAndHtml(`######## SENDING chunk request (${chunkUrl}) from peer: ${peerId}`);
+                    conn.send(
+                        {
+                            type: "request",
+                            requestId,
+                            chunkUrl,
+                        }
+                    );
+                }
+
+                // Timeout to fallback if no peer responds
+                setTimeout(() => {
+                    if (cache.has(chunkUrl)) {
+                        logToConsoleAndHtml(`${requestId}: $$$$$$$$ RETURNING CHUNK ${chunkUrl}`);
+                        if (activeRequests.has(chunkUrl)) {
+                            activeRequests.delete(chunkUrl);
+                            activePeersContact.delete(chunkUrl);
+                            requiredLength.delete(chunkUrl);
+                        }
+                        resolve(cache.get(chunkUrl));
+                    }
+                    else if (activeRequests.has(chunkUrl)) {
+                        logNew(`${requestId}: NO PEER SEEMS TO HAVE RESPONDED`);
+                        logToConsoleAndHtml(`${requestId}: OOPS!!!!! No peer responded for chunk: ${chunkUrl}`);
+                        activeRequests.delete(chunkUrl); // Clean up
+                        activePeersContact.delete(chunkUrl);
+                        requiredLength.delete(chunkUrl);
+                        resolve(null); // Resolve with null to indicate failure
+                    }
+                }, 6000);
+            });
+        }
+
+        class CustomLoader extends Hls.DefaultConfig.loader {
+            constructor(config) {
+                super(config);
+                const originalLoad = this.load.bind(this);
+
+                this.load = async (context, config, callbacks) => {
+                    const chunkUrl = context.url;
+
+                    if (chunkUrl.includes("stream")) {
+                        logToConsoleAndHtml(`Fetching chunk from PoP server: ${chunkUrl}`);
+                        originalLoad(context, config, {
+                            ...callbacks,
+                            onSuccess: (response, stats, context) => {
+                                cache.set(chunkUrl, response.data);
+                                logToConsoleAndHtml(`Chunk cached from PoP: ${chunkUrl}`);
+                                callbacks.onSuccess(response, stats, context);
+                            }
+                        });
+                        return;
+                    }
+
+                    const startTime = new Date();
+                    if (cache.has(chunkUrl)) {
+                        const chunkData = cloneBuffer(cache.get(chunkUrl));
+                        if (chunkData) {
+                            logToConsoleAndHtml(`Serving chunk from cache: ${chunkUrl}`);
+                            const endTime = new Date();
+                            const duration = endTime - startTime;
+                            console.log(`The time taken to call ${chunkUrl} is ${duration} milliseconds (using cached data)`);
+                            storeLatency(duration);
+                            callbacks.onSuccess(
+                                { data: chunkData },
+                                { trequest: performance.now(), tfirst: performance.now(), tload: performance.now() },
+                                context
+                            );
+                            return;
+                        }
+                    }
+
+                    const requestId = generateRandomHash();
+                    logToConsoleAndHtml(`Requesting chunk ${chunkUrl} from peers: its request id is ${requestId}`);
+                    logNew(`Requesting chunk ${chunkUrl} from peers: its request id is ${requestId}`);
+                    const chunkData = await requestChunkFromPeers(requestId, chunkUrl);
+                    if (chunkData) {
+                        const endTime = new Date();
+                        const duration = endTime - startTime;
+                        console.log(`The time taken to call ${chunkUrl} is ${duration} milliseconds (using peer to peer communication)`);
+                        storeLatency(duration);
+                        logNew("------ Yessss!!!!! Got data from peers!!!!!!");
+                        cache.set(chunkUrl, cloneBuffer(chunkData));
+                        callbacks.onSuccess(
+                            { data: chunkData },
+                            { trequest: performance.now(), tfirst: performance.now(), tload: performance.now() },
+                            context
+                        );
+                    } else {
+                        logToConsoleAndHtml(`Fallback to PoP server for: ${chunkUrl}`);
+                        logNew(`Fallback to PoP server for: ${chunkUrl}`);
+                        originalLoad(context, config, {
+                            ...callbacks,
+                            onSuccess: (response, stats, context) => {
+                                const endTime = new Date();
+                                const duration = endTime - startTime;
+                                console.log(`The time taken to call ${chunkUrl} is ${duration} milliseconds (using PoP)`);
+                                storeLatency(duration);
+                                cache.set(chunkUrl, cloneBuffer(response.data));
+                                callbacks.onSuccess(response, stats, context);
+                            }
+                        });
+                    }
+                };
+            }
+        }
+
+        function loadStream() {
+            logToConsoleAndHtml("Loading HLS stream...");
+            if (Hls.isSupported()) {
+                Hls.DefaultConfig.loader = CustomLoader;
+                const hls = new Hls();
+                hls.loadSource(videoSrc);
+                hls.attachMedia(video);
+                hls.on(Hls.Events.MANIFEST_PARSED, () => {
+                    logToConsoleAndHtml("HLS manifest parsed, starting playback...");
+                    video.play();
+                });
+            } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
                 video.src = videoSrc;
-                video.addEventListener('loadedmetadata', function () {
-                    video.play();  // Start playback
+                video.addEventListener("loadedmetadata", () => {
+                    logToConsoleAndHtml("Fallback HLS playback started...");
+                    video.play();
                 });
             }
         }
 
-        // Initial load of the stream
-        loadStream();
-
-        // Add event listener for when the video ends
-        video.addEventListener('ended', function () {
-            console.log("Video ended, reloading the stream...");
-            video.pause();  // Pause the video (optional)
-            video.src = '';  // Clear the video source to reset the player
-            loadStream();  // Reload the stream and continue playback
+        reloadButton.addEventListener("click", () => {
+            logToConsoleAndHtml("Reloading the stream...");
+            video.pause();
+            video.src = '';
+            loadStream();
         });
+
+        video.addEventListener("ended", () => {
+            logToConsoleAndHtml("Reloading the stream on end...");
+            video.pause();
+            video.src = '';
+            loadStream();
+        });
+
+        loadStream();
+        setInterval(() => {
+            if (video.paused) {
+                video.play();
+            }
+        }, 100);
     </script>
 </body>
 </html>
